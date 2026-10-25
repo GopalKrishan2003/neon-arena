@@ -1,5 +1,7 @@
 # Neon Arena
 
+**▶ Play now: https://neon-arena-jeej.onrender.com** (on the free plan, the first load can take up to a minute while the server wakes up)
+
 A real-time multiplayer `.io` browser game. Eat glowing pellets to grow, swallow smaller players, and avoid bigger ones. Boosting makes you faster but costs mass, and it leaves a trail of food that others can grab.
 
 ## Run locally
