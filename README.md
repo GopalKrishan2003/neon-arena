@@ -6,6 +6,15 @@ A real-time multiplayer `.io` browser game. Eat glowing pellets to grow, swallow
 
 Grab **power-ups** scattered around the arena: ⚡ **Speed** (50% faster for 6s), 🛡️ **Shield** (can't be eaten for 5s) and 🧲 **Magnet** (pulls in food from afar for 8s). A live kill feed and "You ate X!" pop-ups show what's happening, and phones vibrate on kills, power-ups and death.
 
+**Difficulty levels:** each level is its own arena, and you only meet players who picked the same one. A 3-second spawn shield protects newcomers on every level.
+
+| | Easy | Medium | Hard |
+|---|---|---|---|
+| Players and bots in the arena | 8 | 14 | 20 |
+| Your starting mass | 30 | 20 | 20 |
+| Food | lots | normal | scarce |
+| Bots | slow, react late, never split | chase and sometimes split-attack | quick, see far, split-attack often and hunt humans first |
+
 **Controls:** steer with the mouse · **Space** to split · click or **Shift** to boost. On phones: a virtual joystick under your left thumb, plus **BOOST** (hold) and **SPLIT** (tap) buttons on the right.
 
 ## Run locally
@@ -20,7 +29,12 @@ Open http://localhost:3000. Open a second tab to play against yourself. Bots kee
 ## How it works
 
 - **Server** (`server/`): Node.js and [`ws`](https://github.com/websockets/ws). The server runs the whole simulation 30 times a second and decides every move and every kill, so players can't cheat by editing the client. Each player only gets the part of the world near their camera.
-- **Client** (`public/`): plain JavaScript and Canvas 2D, with no build step. It smooths between server updates, zooms out as you grow, and works on desktop and mobile.
+- **Client** (`public/`): plain JavaScript and Canvas 2D, with no build step. Works on desktop and mobile.
+- **Smooth over slow connections:**
+  - Your own cells move instantly on your screen (client-side prediction), then quietly correct towards the server's position.
+  - Other players are drawn 100 ms in the past and blended between updates, which hides uneven network timing.
+  - Food goes out 5 times a second instead of 30, which cuts traffic by about 75%.
+  - Glows are pre-drawn images instead of slow canvas shadows.
 
 | File | Purpose |
 |---|---|

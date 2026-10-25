@@ -1,9 +1,7 @@
 export const WORLD = { w: 4000, h: 4000 };
 export const TICK_RATE = 30;
 
-const PELLET_COUNT = 900;
-const MIN_ACTORS = 14; // bots fill the arena up to this many so it never feels empty
-const START_MASS = 20;
+const START_MASS = 20; // also the floor below which boosting stops
 const EAT_RATIO = 1.25; // a cell must be 25% heavier to eat another
 const BOOST_COST = 10; // mass per second, per cell
 const BOOST_MULT = 1.8;
@@ -24,6 +22,50 @@ const POWERUP_RESPAWN = 4; // seconds between new orbs while below POWERUP_COUNT
 const POWERUP_RADIUS = 18;
 const SPEED_MULT = 1.5;
 const MAGNET_REACH = 140; // extra pellet pickup range
+const SPAWN_SHIELD = 3; // seconds
+
+// Each difficulty is its own arena. Players only meet others who picked the same one.
+export const MODES = {
+  easy: {
+    actors: 8, // bots fill the arena up to this many players
+    pellets: 1100,
+    startMass: 30,
+    decay: 0.002, // share of mass big cells lose per second
+    botMass: [12, 30],
+    botSpeed: 0.85,
+    botThink: [0.5, 0.9], // seconds between bot decisions
+    botSight: 250,
+    botSplitChance: 0,
+    botBoostChance: 0.1,
+    botHuntsHumans: false,
+  },
+  medium: {
+    actors: 14,
+    pellets: 900,
+    startMass: 20,
+    decay: 0.003,
+    botMass: [20, 40],
+    botSpeed: 1,
+    botThink: [0.2, 0.4],
+    botSight: 450,
+    botSplitChance: 0.3,
+    botBoostChance: 0.5,
+    botHuntsHumans: false,
+  },
+  hard: {
+    actors: 20,
+    pellets: 700,
+    startMass: 20,
+    decay: 0.004,
+    botMass: [20, 140],
+    botSpeed: 1.08,
+    botThink: [0.08, 0.16],
+    botSight: 650,
+    botSplitChance: 0.7,
+    botBoostChance: 0.8,
+    botHuntsHumans: true,
+  },
+};
 
 const BOT_NAMES = [
   'Nova', 'Pixel', 'Blip', 'Orbit', 'Zed', 'Echo', 'Volt', 'Rune',
@@ -86,7 +128,8 @@ function centroid(p) {
 }
 
 export class Game {
-  constructor() {
+  constructor(mode) {
+    this.mode = mode;
     this.players = new Map();
     this.pellets = new PelletGrid();
     this.nextId = 1;
@@ -99,7 +142,7 @@ export class Game {
   }
 
   refillPellets() {
-    while (this.pellets.count < PELLET_COUNT) {
+    while (this.pellets.count < this.mode.pellets) {
       this.pellets.add({ x: rand(0, WORLD.w), y: rand(0, WORLD.h), hue: Math.floor(rand(0, 360)) });
     }
     if (this.powerups.length < POWERUP_COUNT && this.time >= this.nextPowerupAt) {
@@ -161,13 +204,14 @@ export class Game {
 
   spawnPlayer(name, isBot = false) {
     const { x, y } = this.safeSpawnPoint();
+    const mass = isBot ? rand(...this.mode.botMass) : this.mode.startMass;
     const p = {
       id: this.nextId++,
       name,
       isBot,
-      cells: [this.newCell(x, y, START_MASS)],
-      mass: START_MASS, // total of all cells, refreshed every tick
-      peak: START_MASS,
+      cells: [this.newCell(x, y, mass)],
+      mass, // total of all cells, refreshed every tick
+      peak: mass,
       hue: Math.floor(rand(0, 360)),
       angle: rand(0, Math.PI * 2),
       throttle: isBot ? 1 : 0,
@@ -178,6 +222,8 @@ export class Game {
       thinkTimer: 0,
       effects: { speed: 0, shield: 0, magnet: 0 }, // game time each power-up wears off
     };
+    // A short spawn shield, so new players can't be eaten before they've had a chance to move.
+    if (!isBot) p.effects.shield = this.time + SPAWN_SHIELD;
     this.players.set(p.id, p);
     return p;
   }
@@ -257,7 +303,7 @@ export class Game {
     // Boosting leaves a trail of food behind each cell, so the mass spent isn't lost from the arena.
     const dropNow = p.dropTimer > 1 / BOOST_COST;
     if (dropNow) p.dropTimer = 0;
-    const speedBonus = this.hasEffect(p, 'speed') ? SPEED_MULT : 1;
+    const speedBonus = (this.hasEffect(p, 'speed') ? SPEED_MULT : 1) * (p.isBot ? this.mode.botSpeed : 1);
 
     for (const c of p.cells) {
       const r = radiusOf(c.mass);
@@ -273,7 +319,7 @@ export class Game {
         }
       }
       // Big cells slowly shrink so the leader is always catchable.
-      if (c.mass > 300) c.mass -= c.mass * 0.003 * dt;
+      if (c.mass > 300) c.mass -= c.mass * this.mode.decay * dt;
 
       if (d > 1) {
         c.x += (dx / d) * speed * dt;
@@ -381,9 +427,9 @@ export class Game {
   }
 
   balanceBots() {
-    if (this.players.size < MIN_ACTORS) {
+    if (this.players.size < this.mode.actors) {
       this.spawnPlayer(BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)], true);
-    } else if (this.players.size > MIN_ACTORS) {
+    } else if (this.players.size > this.mode.actors) {
       let smallest = null;
       for (const p of this.players.values()) {
         if (p.isBot && (!smallest || p.mass < smallest.mass)) smallest = p;
@@ -395,7 +441,7 @@ export class Game {
   thinkBot(p, dt) {
     p.thinkTimer -= dt;
     if (p.thinkTimer > 0) return;
-    p.thinkTimer = rand(0.2, 0.4);
+    p.thinkTimer = rand(...this.mode.botThink);
 
     const centre = centroid(p);
     let biggest = p.cells[0];
@@ -409,16 +455,19 @@ export class Game {
     let threatD = Infinity;
     let prey = null;
     let preyD = Infinity;
+    const sight = this.mode.botSight;
     for (const o of this.players.values()) {
       if (o === p) continue;
+      // Hard bots treat humans as closer than they are, so they go after real players first.
+      const bias = this.mode.botHuntsHumans && !o.isBot ? 0.6 : 1;
       for (const c of o.cells) {
-        const d = Math.hypot(c.x - centre.x, c.y - centre.y) - radiusOf(c.mass);
+        const d = (Math.hypot(c.x - centre.x, c.y - centre.y) - radiusOf(c.mass)) * bias;
         if (c.mass > smallest.mass * EAT_RATIO) {
-          if (d < 300 + radiusOf(biggest.mass) && d < threatD) {
+          if (d < sight * 0.66 + radiusOf(biggest.mass) && d < threatD) {
             threat = c;
             threatD = d;
           }
-        } else if (biggest.mass > c.mass * EAT_RATIO && d < 450 && d < preyD) {
+        } else if (biggest.mass > c.mass * EAT_RATIO && d < sight && d < preyD) {
           prey = c;
           preyD = d;
         }
@@ -436,8 +485,11 @@ export class Game {
       p.angle = Math.atan2(prey.y - centre.y, prey.x - centre.x);
       // Split-attack when half of the biggest cell could still swallow the target.
       p.splitRequested =
-        preyD < 250 && p.cells.length < 4 && biggest.mass / 2 > prey.mass * EAT_RATIO && Math.random() < 0.3;
-      p.boost = !p.splitRequested && preyD < 150 && Math.random() < 0.5;
+        preyD < 250 &&
+        p.cells.length < 4 &&
+        biggest.mass / 2 > prey.mass * EAT_RATIO &&
+        Math.random() < this.mode.botSplitChance;
+      p.boost = !p.splitRequested && preyD < 150 && Math.random() < this.mode.botBoostChance;
       return;
     }
     for (const pu of this.powerups) {
@@ -460,6 +512,12 @@ export class Game {
     else p.angle += rand(-0.6, 0.6);
   }
 
+  humanCount() {
+    let n = 0;
+    for (const p of this.players.values()) if (!p.isBot) n++;
+    return n;
+  }
+
   leaderboard() {
     return [...this.players.values()]
       .sort((a, b) => b.mass - a.mass)
@@ -469,7 +527,7 @@ export class Game {
 
   // What one viewer sees: everything near their camera, packed into arrays to keep messages small.
   // Viewers without a live player (menu / death screen) spectate the leader.
-  snapshot(viewerId, leaderboard) {
+  snapshot(viewerId, leaderboard, withPellets) {
     const me = this.players.get(viewerId);
     const target = me ?? this.players.get(leaderboard[0]?.[0]);
     let focus = { x: WORLD.w / 2, y: WORLD.h / 2 };
@@ -502,13 +560,17 @@ export class Game {
     for (const pu of this.powerups) {
       if (inView(pu.x, pu.y, POWERUP_RADIUS)) powerups.push(Math.round(pu.x), Math.round(pu.y), pu.type);
     }
-    const pellets = [];
-    this.pellets.forEachIn(focus.x - half, focus.y - half, focus.x + half, focus.y + half, (f) => {
-      pellets.push(Math.round(f.x), Math.round(f.y), f.hue);
-      return false;
-    });
+    let pellets;
+    if (withPellets) {
+      pellets = [];
+      this.pellets.forEachIn(focus.x - half, focus.y - half, focus.x + half, focus.y + half, (f) => {
+        pellets.push(Math.round(f.x), Math.round(f.y), f.hue);
+        return false;
+      });
+    }
     return {
       t: 's',
+      ts: Date.now(),
       you: me ? me.id : null,
       mass: me ? Math.floor(me.mass) : 0,
       cam: [Math.round(focus.x), Math.round(focus.y)],

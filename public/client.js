@@ -1,18 +1,35 @@
-const canvas = document.getElementById('game');
+const $ = (id) => document.getElementById(id);
+const canvas = $('game');
 const ctx = canvas.getContext('2d');
-const menu = document.getElementById('menu');
-const joinForm = document.getElementById('join');
-const nameInput = document.getElementById('name');
-const playBtn = document.getElementById('play');
-const statusEl = document.getElementById('status');
-const leaderboardEl = document.getElementById('leaderboard');
-const scoreEl = document.getElementById('score');
-const effectsEl = document.getElementById('effects');
-const onlineEl = document.getElementById('online');
-const feedEl = document.getElementById('feed');
-const toastEl = document.getElementById('toast');
-const splitBtn = document.getElementById('split-btn');
-const boostBtn = document.getElementById('boost-btn');
+const menu = $('menu');
+const joinForm = $('join');
+const nameInput = $('name');
+const playBtn = $('play');
+const statusEl = $('status');
+const leaderboardEl = $('leaderboard');
+const scoreEl = $('score');
+const effectsEl = $('effects');
+const onlineEl = $('online');
+const feedEl = $('feed');
+const toastEl = $('toast');
+const splitBtn = $('split-btn');
+const boostBtn = $('boost-btn');
+const modeButtons = [...document.querySelectorAll('.mode')];
+
+// Mirrors of server/game.js rules, used to predict my own movement without waiting for the server.
+const BOOST_FLOOR = 25;
+const BOOST_MULT = 1.8;
+const SPEED_MULT = 1.5;
+const STEER_REACH = 400;
+const MIN_SPLIT_MASS = 36;
+const MAX_CELLS = 16;
+const MAGNET_REACH = 140;
+const speedOf = (mass) => 340 * Math.pow(mass, -0.18);
+const massOf = (r) => (r / 6) ** 2;
+
+// Other players are drawn this far in the past, so there are always two updates to blend between.
+const INTERP_DELAY = 100;
+const JOY_RADIUS = 64;
 
 // Same order as POWERUP_TYPES on the server.
 const POWERUPS = [
@@ -20,18 +37,38 @@ const POWERUPS = [
   { icon: '🛡️', name: 'Shield', color: '#4dd2ff' },
   { icon: '🧲', name: 'Magnet', color: '#c77dff' },
 ];
-const MAGNET_REACH = 140;
-const JOY_RADIUS = 60;
+const MODE_LABELS = { easy: 'Easy', medium: 'Medium', hard: 'Hard' };
 
 const isTouch = matchMedia('(pointer: coarse)').matches;
 document.body.classList.toggle('touch', isTouch);
 
+const store = {
+  get(key, fallback) {
+    try {
+      return JSON.parse(localStorage.getItem(key)) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {}
+  },
+};
+
 let ws;
 let world = { w: 4000, h: 4000 };
 let myId = null;
+let mode = MODE_LABELS[store.get('mode')] ? store.get('mode') : 'medium';
+const best = store.get('best', { easy: 0, medium: 0, hard: 0 });
+let pellets = [];
+let powerups = [];
 let latest = null; // last snapshot from the server
 let lastEffects = [0, 0, 0];
-const blobs = new Map(); // cell id -> smoothed render state
+let rtt = 150; // ms, measured with pings
+let clockOffset = null; // local Date.now() minus server timestamp, at its lowest (least delayed)
+const blobs = new Map(); // cell id -> render state
 const camera = { x: 2000, y: 2000, scale: 1 };
 const input = { mx: 0, my: 0, boost: false, angle: 0 };
 // The joystick appears wherever the thumb lands on the canvas and follows it until release.
@@ -40,11 +77,9 @@ let cw = 0;
 let ch = 0;
 let dpr = 1;
 
-try {
-  nameInput.value = localStorage.getItem('name') ?? '';
-} catch {}
-
-const vibrate = (pattern) => navigator.vibrate?.(pattern);
+nameInput.value = store.get('name', '');
+// Browsers refuse to vibrate before the first tap, and log an error if you try.
+const vibrate = (pattern) => navigator.userActivation?.hasBeenActive && navigator.vibrate?.(pattern);
 
 // ---- networking -----------------------------------------------------------
 
@@ -53,6 +88,8 @@ function connect() {
   ws.onopen = () => {
     playBtn.disabled = false;
     playBtn.textContent = 'PLAY';
+    if (statusEl.textContent.startsWith('Connection lost')) statusEl.textContent = '';
+    send({ t: 'watch', mode });
   };
   ws.onmessage = (e) => handle(JSON.parse(e.data));
   ws.onclose = () => {
@@ -68,10 +105,21 @@ function send(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
+setInterval(() => send({ t: 'ping', c: performance.now() }), 2000);
+
 function handle(msg) {
   switch (msg.t) {
     case 'welcome':
       world = msg.world;
+      break;
+    case 'pong':
+      rtt = rtt * 0.7 + (performance.now() - msg.c) * 0.3;
+      break;
+    case 'counts':
+      for (const btn of modeButtons) {
+        const n = msg[btn.dataset.mode] ?? 0;
+        btn.querySelector('.count').textContent = n === 1 ? '1 player' : `${n} players`;
+      }
       break;
     case 'joined':
       myId = msg.id;
@@ -79,11 +127,19 @@ function handle(msg) {
       menu.hidden = true;
       document.body.classList.add('playing');
       break;
-    case 'dead':
+    case 'dead': {
       myId = null;
       vibrate([80, 60, 160]);
-      showMenu(`Eaten by ${msg.killer} · score ${msg.score}`);
+      const previous = best[msg.mode] ?? 0;
+      if (msg.score > previous) {
+        best[msg.mode] = msg.score;
+        store.set('best', best);
+        renderBest();
+      }
+      const record = previous > 0 && msg.score > previous;
+      showMenu(`Eaten by ${msg.killer} · score ${msg.score}${record ? ' · new best!' : ''}`);
       break;
+    }
     case 'kill':
       vibrate(40);
       toast(`You ate ${msg.victim}!`, '#36f1cd');
@@ -99,53 +155,75 @@ function handle(msg) {
 
 function applySnapshot(s) {
   latest = s;
+  if (s.f) pellets = s.f;
+  powerups = s.pu;
+
+  // Track the smallest offset seen: that's the update that travelled fastest. Let it creep up slowly
+  // in case the clocks drift.
+  const offset = Date.now() - s.ts;
+  clockOffset = clockOffset === null || offset < clockOffset ? offset : clockOffset + (offset - clockOffset) * 0.02;
+
   const owners = new Map(s.o.map(([id, name, hue, flags]) => [id, { name, hue, flags }]));
   const seen = new Set();
   for (const [id, owner, x, y, r] of s.c) {
     seen.add(id);
     const { name, hue, flags } = owners.get(owner);
-    const b = blobs.get(id);
-    if (b) {
-      b.tx = x;
-      b.ty = y;
-      b.tr = r;
-      b.flags = flags;
-      continue;
-    }
-    // A freshly split cell starts inside its sibling, so it visibly shoots out instead of popping in.
-    let start = { x, y };
-    let nearest = Infinity;
-    for (const o of blobs.values()) {
-      const d = o.owner === owner ? Math.hypot(o.x - x, o.y - y) : Infinity;
-      if (d < nearest && d < o.r * 3) {
-        nearest = d;
-        start = o;
+    let b = blobs.get(id);
+    if (!b) {
+      // A freshly split cell starts inside its sibling, so it visibly shoots out instead of popping in.
+      let start = { x, y, r };
+      let nearest = Infinity;
+      for (const o of blobs.values()) {
+        const d = o.owner === owner ? Math.hypot(o.x - x, o.y - y) : Infinity;
+        if (d < nearest && d < o.r * 3) {
+          nearest = d;
+          start = o;
+        }
       }
+      b = { owner, hue, name, x: start.x, y: start.y, r, px: start.x, py: start.y, born: performance.now(), samples: [] };
+      b.samples.push({ t: s.ts - 50, x: start.x, y: start.y, r });
+      blobs.set(id, b);
     }
-    blobs.set(id, { x: start.x, y: start.y, r, tx: x, ty: y, tr: r, owner, hue, name, flags });
+    b.flags = flags;
+    b.sx = x;
+    b.sy = y;
+    b.sr = r;
+    b.samples.push({ t: s.ts, x, y, r });
+    if (b.samples.length > 8) b.samples.shift();
   }
   for (const id of blobs.keys()) if (!seen.has(id)) blobs.delete(id);
 
-  scoreEl.textContent = myId ? `Mass ${s.mass}` : '';
-  onlineEl.textContent = `${s.online} in arena`;
+  setText(scoreEl, myId ? `${s.mass}` : '');
+  setText(onlineEl, `${MODE_LABELS[mode]} · ${s.online} in arena`);
   renderLeaderboard(s.lb);
   renderEffects(s.fx);
 }
 
+// DOM writes are slow on phones, so only touch the page when something actually changed.
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+let leaderboardKey = '';
 function renderLeaderboard(lb) {
+  const key = JSON.stringify(lb) + myId;
+  if (key === leaderboardKey) return;
+  leaderboardKey = key;
   leaderboardEl.replaceChildren(
-    ...lb.map(([id, name, mass]) => {
+    ...lb.map(([id, name, mass], i) => {
       const li = document.createElement('li');
-      li.textContent = name;
       li.classList.toggle('me', id === myId);
+      const rank = document.createElement('i');
+      rank.textContent = i + 1;
       const m = document.createElement('span');
       m.textContent = mass;
-      li.append(m);
+      li.append(rank, name, m);
       return li;
     }),
   );
 }
 
+let effectsKey = '';
 function renderEffects(fx) {
   fx.forEach((secs, i) => {
     if (secs > 0 && lastEffects[i] === 0) {
@@ -154,6 +232,9 @@ function renderEffects(fx) {
     }
   });
   lastEffects = fx.length ? fx : [0, 0, 0];
+  const key = fx.join();
+  if (key === effectsKey) return;
+  effectsKey = key;
   effectsEl.replaceChildren(
     ...fx.flatMap((secs, i) => {
       if (secs <= 0) return [];
@@ -189,31 +270,53 @@ function addFeed(killer, victim) {
   setTimeout(() => li.remove(), 6000);
 }
 
+// ---- menu -----------------------------------------------------------------
+
+function renderBest() {
+  for (const btn of modeButtons) {
+    const score = best[btn.dataset.mode] ?? 0;
+    btn.querySelector('.best').textContent = score ? `Best ${score}` : 'No best yet';
+  }
+}
+
+function selectMode(next) {
+  mode = next;
+  store.set('mode', mode);
+  for (const btn of modeButtons) btn.setAttribute('aria-checked', btn.dataset.mode === mode);
+  document.body.dataset.mode = mode;
+  send({ t: 'watch', mode });
+}
+
+for (const btn of modeButtons) btn.addEventListener('click', () => selectMode(btn.dataset.mode));
+selectMode(mode);
+renderBest();
+
 function showMenu(message) {
   statusEl.textContent = message;
   menu.hidden = false;
   document.body.classList.remove('playing');
   input.boost = false;
+  boostBtn.classList.remove('held');
   joy.id = null;
-  if (!isTouch) nameInput.focus();
 }
 
 joinForm.addEventListener('submit', (e) => {
   e.preventDefault();
   const name = nameInput.value.trim();
-  try {
-    localStorage.setItem('name', name);
-  } catch {}
+  store.set('name', name);
   nameInput.blur(); // closes the on-screen keyboard
-  send({ t: 'join', name });
+  send({ t: 'join', name, mode });
 });
 
 // ---- input ----------------------------------------------------------------
 
 function split() {
-  if (myId === null) return;
+  if (myId === null || splitBtn.disabled) return;
   send({ t: 'split' });
   vibrate(15);
+  splitBtn.classList.remove('fired');
+  void splitBtn.offsetWidth;
+  splitBtn.classList.add('fired');
 }
 
 canvas.addEventListener('mousemove', (e) => {
@@ -273,6 +376,7 @@ boostBtn.addEventListener('touchstart', (e) => {
   e.preventDefault();
   input.boost = true;
   boostBtn.classList.add('held');
+  vibrate(10);
 }, { passive: false });
 for (const type of ['touchend', 'touchcancel']) {
   boostBtn.addEventListener(type, () => {
@@ -302,10 +406,102 @@ setInterval(() => {
   send({ t: 'input', ...steering(), boost: input.boost });
 }, 50);
 
+// ---- simulation -----------------------------------------------------------
+
+// Places another player's cell where it was INTERP_DELAY ago, blending the two updates around that time.
+function interpolate(b, renderT) {
+  const s = b.samples;
+  let i = s.length - 1;
+  while (i > 0 && s[i - 1].t > renderT) i--;
+  const a = s[Math.max(0, i - 1)];
+  const c = s[i];
+  const span = c.t - a.t;
+  const k = span > 0 ? Math.max(0, Math.min(1, (renderT - a.t) / span)) : 1;
+  b.x = a.x + (c.x - a.x) * k;
+  b.y = a.y + (c.y - a.y) * k;
+  b.r = a.r + (c.r - a.r) * k;
+}
+
+// Moves my cells the way the server will, right away, then nudges them towards the server's answer.
+function predictMine(dt, now) {
+  const { angle, throttle } = steering();
+  let cx = 0;
+  let cy = 0;
+  let w = 0;
+  for (const b of blobs.values()) {
+    if (b.owner !== myId) continue;
+    cx += b.px * b.r * b.r;
+    cy += b.py * b.r * b.r;
+    w += b.r * b.r;
+  }
+  if (w === 0) return;
+  const tx = cx / w + Math.cos(angle) * STEER_REACH * throttle;
+  const ty = cy / w + Math.sin(angle) * STEER_REACH * throttle;
+  const speedy = latest?.fx?.[0] > 0 ? SPEED_MULT : 1;
+  const lead = rtt / 1000; // our latest input reaches the server about one round trip after the state we hold
+
+  for (const b of blobs.values()) {
+    if (b.owner !== myId) continue;
+    b.r += (b.sr - b.r) * (1 - Math.exp(-dt * 12));
+    const mass = massOf(b.sr);
+    const dx = tx - b.px;
+    const dy = ty - b.py;
+    const d = Math.hypot(dx, dy);
+    let speed = speedOf(mass) * Math.min(1, d / STEER_REACH) * speedy;
+    if (input.boost && mass > BOOST_FLOOR && d > 40) speed *= BOOST_MULT;
+    const vx = d > 1 ? (dx / d) * speed : 0;
+    const vy = d > 1 ? (dy / d) * speed : 0;
+    b.px += vx * dt;
+    b.py += vy * dt;
+
+    const gx = b.sx + vx * lead;
+    const gy = b.sy + vy * lead;
+    const err = Math.hypot(gx - b.px, gy - b.py);
+    if (err > 300) {
+      b.px = gx;
+      b.py = gy;
+    } else {
+      // Freshly split cells are flung by the server, so follow it closely for a moment.
+      const rate = now - b.born < 700 ? 14 : 5;
+      const k = 1 - Math.exp(-dt * rate);
+      b.px += (gx - b.px) * k;
+      b.py += (gy - b.py) * k;
+    }
+    b.px = Math.max(b.r, Math.min(world.w - b.r, b.px));
+    b.py = Math.max(b.r, Math.min(world.h - b.r, b.py));
+    b.x = b.px;
+    b.y = b.py;
+  }
+}
+
+// Area-weighted centre of my cells and how far they reach from it, or null if none are visible.
+function myCentre() {
+  let x = 0;
+  let y = 0;
+  let w = 0;
+  let count = 0;
+  let canSplit = false;
+  for (const b of blobs.values()) {
+    if (b.owner !== myId) continue;
+    x += b.x * b.r * b.r;
+    y += b.y * b.r * b.r;
+    w += b.r * b.r;
+    count++;
+    if (massOf(b.sr) >= MIN_SPLIT_MASS) canSplit = true;
+  }
+  if (w === 0) return null;
+  const centre = { x: x / w, y: y / w, spread: 0, canSplit: canSplit && count < MAX_CELLS };
+  for (const b of blobs.values()) {
+    if (b.owner === myId) centre.spread = Math.max(centre.spread, Math.hypot(b.x - centre.x, b.y - centre.y) + b.r);
+  }
+  return centre;
+}
+
 // ---- rendering ------------------------------------------------------------
 
 function resize() {
-  dpr = window.devicePixelRatio || 1;
+  // Phones report up to 3x pixel density; 2x looks the same and draws far fewer pixels.
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
   cw = window.innerWidth;
   ch = window.innerHeight;
   canvas.width = cw * dpr;
@@ -315,6 +511,38 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 resize();
+
+// Canvas shadows are very slow on phones, so glows and pellets are pre-drawn once and stamped.
+const sprites = new Map();
+function sprite(key, size, draw) {
+  let s = sprites.get(key);
+  if (!s) {
+    s = document.createElement('canvas');
+    s.width = s.height = size;
+    draw(s.getContext('2d'), size);
+    sprites.set(key, s);
+  }
+  return s;
+}
+const glowSprite = (color) =>
+  sprite(`glow:${color}`, 128, (g, n) => {
+    const grad = g.createRadialGradient(n / 2, n / 2, n * 0.25, n / 2, n / 2, n / 2);
+    grad.addColorStop(0, color);
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.globalAlpha = 0.55;
+    g.fillStyle = grad;
+    g.fillRect(0, 0, n, n);
+  });
+const pelletSprite = (hue) =>
+  sprite(`pellet:${hue}`, 32, (g, n) => {
+    const grad = g.createRadialGradient(n / 2, n / 2, 0, n / 2, n / 2, n / 2);
+    grad.addColorStop(0, `hsl(${hue} 100% 75%)`);
+    grad.addColorStop(0.35, `hsl(${hue} 100% 62%)`);
+    grad.addColorStop(0.45, `hsla(${hue}, 100%, 60%, 0.35)`);
+    grad.addColorStop(1, `hsla(${hue}, 100%, 60%, 0)`);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, n, n);
+  });
 
 function drawGrid(halfW, halfH) {
   const step = 50;
@@ -335,43 +563,51 @@ function drawGrid(halfW, halfH) {
   }
   ctx.stroke();
 
-  ctx.strokeStyle = '#ff3ea5';
-  ctx.lineWidth = 6;
-  ctx.shadowColor = '#ff3ea5';
-  ctx.shadowBlur = 20;
+  ctx.strokeStyle = 'rgba(255, 62, 165, 0.25)';
+  ctx.lineWidth = 24;
   ctx.strokeRect(0, 0, world.w, world.h);
-  ctx.shadowBlur = 0;
+  ctx.strokeStyle = '#ff3ea5';
+  ctx.lineWidth = 5;
+  ctx.strokeRect(0, 0, world.w, world.h);
 }
 
-function drawPellets() {
-  const f = latest?.f ?? [];
-  for (let i = 0; i < f.length; i += 3) {
-    ctx.fillStyle = `hsl(${f[i + 2]} 100% 65%)`;
-    ctx.beginPath();
-    ctx.arc(f[i], f[i + 1], 5, 0, Math.PI * 2);
-    ctx.fill();
+function drawPellets(halfW, halfH) {
+  const list = [...blobs.values()];
+  for (let i = 0; i < pellets.length; i += 3) {
+    const x = pellets[i];
+    const y = pellets[i + 1];
+    if (Math.abs(x - camera.x) > halfW + 10 || Math.abs(y - camera.y) > halfH + 10) continue;
+    // Pellets only refresh 5x a second, so hide any a cell is already covering.
+    let covered = false;
+    for (const b of list) {
+      if ((b.x - x) ** 2 + (b.y - y) ** 2 < b.r * b.r) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) ctx.drawImage(pelletSprite(Math.round(pellets[i + 2] / 15) * 15), x - 12, y - 12, 24, 24);
   }
 }
 
 function drawPowerups(now) {
-  const pu = latest?.pu ?? [];
   const pulse = 1 + Math.sin(now / 200) * 0.12;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = '18px system-ui, sans-serif';
-  for (let i = 0; i < pu.length; i += 3) {
-    const style = POWERUPS[pu[i + 2]];
-    ctx.shadowColor = style.color;
-    ctx.shadowBlur = 25;
+  for (let i = 0; i < powerups.length; i += 3) {
+    const x = powerups[i];
+    const y = powerups[i + 1];
+    const style = POWERUPS[powerups[i + 2]];
+    const r = 18 * pulse;
+    ctx.drawImage(glowSprite(style.color), x - r * 2.4, y - r * 2.4, r * 4.8, r * 4.8);
+    ctx.fillStyle = 'rgba(5, 6, 15, 0.85)';
     ctx.strokeStyle = style.color;
     ctx.lineWidth = 3;
-    ctx.fillStyle = 'rgba(5, 6, 15, 0.8)';
     ctx.beginPath();
-    ctx.arc(pu[i], pu[i + 1], 18 * pulse, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
-    ctx.shadowBlur = 0;
-    ctx.fillText(style.icon, pu[i], pu[i + 1] + 1);
+    ctx.fillText(style.icon, x, y + 1);
   }
 }
 
@@ -380,7 +616,7 @@ function drawBlobs(now) {
   for (const b of sorted) {
     if (b.flags & 4) {
       // Magnet: show the pickup range.
-      ctx.fillStyle = 'rgba(199, 125, 255, 0.08)';
+      ctx.fillStyle = 'rgba(199, 125, 255, 0.07)';
       ctx.strokeStyle = 'rgba(199, 125, 255, 0.35)';
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -389,13 +625,13 @@ function drawBlobs(now) {
       ctx.stroke();
     }
 
-    ctx.shadowColor = b.flags & 1 ? '#ffd23f' : `hsl(${b.hue} 100% 60%)`;
-    ctx.shadowBlur = b.flags & 1 ? 45 : 25;
+    const glow = b.flags & 1 ? '#ffd23f' : `hsl(${Math.round(b.hue / 10) * 10} 100% 60%)`;
+    const g = b.r * (b.flags & 1 ? 1.9 : 1.55);
+    ctx.drawImage(glowSprite(glow), b.x - g, b.y - g, g * 2, g * 2);
     ctx.fillStyle = `hsl(${b.hue} 85% 45%)`;
     ctx.beginPath();
     ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
     ctx.fill();
-    ctx.shadowBlur = 0;
     ctx.lineWidth = Math.max(3, b.r * 0.08);
     ctx.strokeStyle = `hsl(${b.hue} 100% 70%)`;
     ctx.stroke();
@@ -413,6 +649,8 @@ function drawBlobs(now) {
       ctx.restore();
     }
 
+    // Names too small to read on screen aren't worth the cost of drawing text.
+    if (b.r * camera.scale < 9) continue;
     const size = Math.max(12, b.r * 0.38);
     ctx.font = `700 ${size}px system-ui, sans-serif`;
     ctx.textAlign = 'center';
@@ -427,9 +665,9 @@ function drawBlobs(now) {
 
 function drawMinimap(me) {
   // On phones the bottom corners belong to the thumbs, so the map moves to the top-left.
-  const size = isTouch ? 84 : Math.min(140, cw * 0.28);
-  const x = isTouch ? 16 : cw - size - 16;
-  const y = isTouch ? 56 : ch - size - 16;
+  const size = isTouch ? 76 : Math.min(140, cw * 0.28);
+  const x = isTouch ? 12 : cw - size - 16;
+  const y = isTouch ? 52 : ch - size - 16;
   ctx.fillStyle = 'rgba(12, 14, 32, 0.72)';
   ctx.fillRect(x, y, size, size);
   ctx.strokeStyle = 'rgba(255, 62, 165, 0.6)';
@@ -445,49 +683,52 @@ function drawMinimap(me) {
 function drawJoystick() {
   // Until the thumb lands, a faint joystick sits bottom-left to show where to steer.
   const active = joy.id !== null;
-  const bx = active ? joy.bx : 90;
-  const by = active ? joy.by : ch - 110;
+  const bx = active ? joy.bx : 96;
+  const by = active ? joy.by : ch - 120;
   const kx = active ? joy.kx : bx;
   const ky = active ? joy.ky : by;
-  ctx.globalAlpha = active ? 0.9 : 0.45;
-  ctx.fillStyle = 'rgba(54, 241, 205, 0.08)';
-  ctx.strokeStyle = 'rgba(54, 241, 205, 0.6)';
+  const pull = Math.hypot(kx - bx, ky - by) / JOY_RADIUS;
+
+  ctx.globalAlpha = active ? 1 : 0.55;
+  const ring = ctx.createRadialGradient(bx, by, JOY_RADIUS * 0.4, bx, by, JOY_RADIUS);
+  ring.addColorStop(0, 'rgba(54, 241, 205, 0.02)');
+  ring.addColorStop(1, 'rgba(54, 241, 205, 0.16)');
+  ctx.fillStyle = ring;
+  ctx.strokeStyle = 'rgba(54, 241, 205, 0.55)';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(bx, by, JOY_RADIUS, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = 'rgba(54, 241, 205, 0.55)';
+
+  if (active && pull > 0.1) {
+    // Arc on the rim showing which way you're heading, brighter the harder you push.
+    const a = Math.atan2(ky - by, kx - bx);
+    ctx.strokeStyle = `rgba(54, 241, 205, ${0.4 + pull * 0.6})`;
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(bx, by, JOY_RADIUS + 6, a - 0.45, a + 0.45);
+    ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
+
+  ctx.drawImage(glowSprite('#36f1cd'), kx - 44, ky - 44, 88, 88);
+  ctx.fillStyle = '#36f1cd';
   ctx.beginPath();
-  ctx.arc(kx, ky, 26, 0, Math.PI * 2);
+  ctx.arc(kx, ky, 24, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(4, 19, 26, 0.35)';
+  ctx.beginPath();
+  ctx.arc(kx, ky, 12, 0, Math.PI * 2);
   ctx.fill();
   if (!active) {
     ctx.fillStyle = '#e8ecff';
     ctx.font = '700 11px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('MOVE', bx, by);
+    ctx.fillText('DRAG TO MOVE', bx, by + JOY_RADIUS + 18);
   }
   ctx.globalAlpha = 1;
-}
-
-// Area-weighted centre of my cells and how far they reach from it, or null if none are visible.
-function myCentre() {
-  let x = 0;
-  let y = 0;
-  let w = 0;
-  for (const b of blobs.values()) {
-    if (b.owner !== myId) continue;
-    x += b.x * b.r * b.r;
-    y += b.y * b.r * b.r;
-    w += b.r * b.r;
-  }
-  if (w === 0) return null;
-  const centre = { x: x / w, y: y / w, spread: 0 };
-  for (const b of blobs.values()) {
-    if (b.owner === myId) centre.spread = Math.max(centre.spread, Math.hypot(b.x - centre.x, b.y - centre.y) + b.r);
-  }
-  return centre;
 }
 
 let last = performance.now();
@@ -495,19 +736,18 @@ function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
 
-  // Snapshots arrive 30x a second; ease towards them so motion looks smooth at any frame rate.
-  const k = 1 - Math.exp(-dt * 12);
-  for (const b of blobs.values()) {
-    b.x += (b.tx - b.x) * k;
-    b.y += (b.ty - b.y) * k;
-    b.r += (b.tr - b.r) * k;
-  }
+  const renderT = Date.now() - (clockOffset ?? 0) - INTERP_DELAY;
+  for (const b of blobs.values()) if (b.owner !== myId) interpolate(b, renderT);
+  if (myId !== null) predictMine(dt, now);
 
   const me = myId !== null ? myCentre() : null;
   if (me) {
     camera.x = me.x;
     camera.y = me.y;
+    splitBtn.disabled = !me.canSplit;
+    boostBtn.disabled = latest.mass <= BOOST_FLOOR;
   } else if (latest) {
+    const k = 1 - Math.exp(-dt * 4);
     camera.x += (latest.cam[0] - camera.x) * k;
     camera.y += (latest.cam[1] - camera.y) * k;
   }
@@ -520,12 +760,14 @@ function frame(now) {
   ctx.fillStyle = '#05060f';
   ctx.fillRect(0, 0, cw, ch);
 
+  const halfW = cw / 2 / camera.scale;
+  const halfH = ch / 2 / camera.scale;
   ctx.save();
   ctx.translate(cw / 2, ch / 2);
   ctx.scale(camera.scale, camera.scale);
   ctx.translate(-camera.x, -camera.y);
-  drawGrid(cw / 2 / camera.scale, ch / 2 / camera.scale);
-  drawPellets();
+  drawGrid(halfW, halfH);
+  drawPellets(halfW, halfH);
   drawPowerups(now);
   drawBlobs(now);
   ctx.restore();
