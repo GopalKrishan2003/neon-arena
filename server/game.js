@@ -4,9 +4,17 @@ export const TICK_RATE = 30;
 const PELLET_COUNT = 900;
 const MIN_ACTORS = 14; // bots fill the arena up to this many so it never feels empty
 const START_MASS = 20;
-const EAT_RATIO = 1.25; // you must be 25% heavier to eat someone
-const BOOST_COST = 10; // mass per second
+const EAT_RATIO = 1.25; // a cell must be 25% heavier to eat another
+const BOOST_COST = 10; // mass per second, per cell
 const BOOST_MULT = 1.8;
+const MAX_CELLS = 16;
+const MIN_SPLIT_MASS = 36; // a cell needs this much mass to split in two
+const SPLIT_SPEED = 900; // launch speed of a freshly split cell
+const SPLIT_FRICTION = 4.5; // how fast that launch slows down
+const SPLIT_COOLDOWN = 0.15;
+const STEER_REACH = 400; // full throttle aims this far ahead of the player's centre
+const mergeDelay = (mass) => 8 + mass * 0.02; // seconds before split cells can rejoin
+const GRID = 128; // pellet bucket size
 
 const BOT_NAMES = [
   'Nova', 'Pixel', 'Blip', 'Orbit', 'Zed', 'Echo', 'Volt', 'Rune',
@@ -18,19 +26,77 @@ const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const radiusOf = (mass) => 6 * Math.sqrt(mass);
 const speedOf = (mass) => 340 * Math.pow(mass, -0.18);
 
+// Pellets bucketed by position, so cells only check the food right around them.
+class PelletGrid {
+  constructor() {
+    this.cols = Math.ceil(WORLD.w / GRID);
+    this.rows = Math.ceil(WORLD.h / GRID);
+    this.buckets = Array.from({ length: this.cols * this.rows }, () => []);
+    this.count = 0;
+  }
+
+  add(pellet) {
+    const cx = clamp(Math.floor(pellet.x / GRID), 0, this.cols - 1);
+    const cy = clamp(Math.floor(pellet.y / GRID), 0, this.rows - 1);
+    this.buckets[cy * this.cols + cx].push(pellet);
+    this.count++;
+  }
+
+  // Calls fn for every pellet in the box; a pellet is removed when fn returns true.
+  forEachIn(x0, y0, x1, y1, fn) {
+    const cx0 = clamp(Math.floor(x0 / GRID), 0, this.cols - 1);
+    const cx1 = clamp(Math.floor(x1 / GRID), 0, this.cols - 1);
+    const cy0 = clamp(Math.floor(y0 / GRID), 0, this.rows - 1);
+    const cy1 = clamp(Math.floor(y1 / GRID), 0, this.rows - 1);
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const bucket = this.buckets[cy * this.cols + cx];
+        for (let i = bucket.length - 1; i >= 0; i--) {
+          if (fn(bucket[i])) {
+            bucket[i] = bucket[bucket.length - 1];
+            bucket.pop();
+            this.count--;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Mass-weighted centre of a player's cells.
+function centroid(p) {
+  let x = 0;
+  let y = 0;
+  let m = 0;
+  for (const c of p.cells) {
+    x += c.x * c.mass;
+    y += c.y * c.mass;
+    m += c.mass;
+  }
+  return { x: x / m, y: y / m };
+}
+
 export class Game {
   constructor() {
     this.players = new Map();
-    this.pellets = [];
+    this.pellets = new PelletGrid();
     this.nextId = 1;
-    for (let i = 0; i < PELLET_COUNT; i++) this.pellets.push(this.randomPellet());
+    this.nextCellId = 1;
+    this.time = 0;
+    this.refillPellets();
   }
 
-  randomPellet() {
-    return { x: rand(0, WORLD.w), y: rand(0, WORLD.h), hue: Math.floor(rand(0, 360)) };
+  refillPellets() {
+    while (this.pellets.count < PELLET_COUNT) {
+      this.pellets.add({ x: rand(0, WORLD.w), y: rand(0, WORLD.h), hue: Math.floor(rand(0, 360)) });
+    }
   }
 
-  // Picks the spawn point (out of a few tries) farthest from anyone big enough to eat a newcomer.
+  newCell(x, y, mass) {
+    return { id: this.nextCellId++, x, y, mass, vx: 0, vy: 0, mergeAt: 0 };
+  }
+
+  // Picks the spawn point (out of a few tries) farthest from any cell big enough to eat a newcomer.
   safeSpawnPoint() {
     let best = null;
     let bestScore = -Infinity;
@@ -39,8 +105,10 @@ export class Game {
       const y = rand(200, WORLD.h - 200);
       let nearest = Infinity;
       for (const p of this.players.values()) {
-        if (p.mass < START_MASS * EAT_RATIO) continue;
-        nearest = Math.min(nearest, Math.hypot(p.x - x, p.y - y) - radiusOf(p.mass));
+        for (const c of p.cells) {
+          if (c.mass < START_MASS * EAT_RATIO) continue;
+          nearest = Math.min(nearest, Math.hypot(c.x - x, c.y - y) - radiusOf(c.mass));
+        }
       }
       if (nearest > bestScore) {
         best = { x, y };
@@ -56,14 +124,15 @@ export class Game {
       id: this.nextId++,
       name,
       isBot,
-      x,
-      y,
-      mass: START_MASS,
+      cells: [this.newCell(x, y, START_MASS)],
+      mass: START_MASS, // total of all cells, refreshed every tick
       peak: START_MASS,
       hue: Math.floor(rand(0, 360)),
       angle: rand(0, Math.PI * 2),
       throttle: isBot ? 1 : 0,
       boost: false,
+      splitRequested: false,
+      lastSplit: -Infinity,
       dropTimer: 0,
       thinkTimer: 0,
     };
@@ -83,76 +152,177 @@ export class Game {
     p.boost = input.boost === true;
   }
 
+  requestSplit(id) {
+    const p = this.players.get(id);
+    if (p && !p.isBot) p.splitRequested = true;
+  }
+
   // Advances the simulation by dt seconds. Returns the players eaten this tick, keyed by id.
   tick(dt) {
+    this.time += dt;
     this.balanceBots();
     for (const p of this.players.values()) {
       if (p.isBot) this.thinkBot(p, dt);
+      // A request made during the cooldown waits for it, so a quick double-tap still splits twice.
+      if (p.splitRequested && this.time - p.lastSplit >= SPLIT_COOLDOWN) {
+        p.splitRequested = false;
+        this.split(p);
+      }
       this.move(p, dt);
-      this.eatPellets(p);
+      for (const c of p.cells) this.eatPellets(c);
+      this.pushApartOwnCells(p);
+      this.mergeOwnCells(p);
     }
-    return this.resolveCollisions();
+    this.refillPellets();
+    const eaten = this.resolveCollisions();
+    for (const p of this.players.values()) {
+      p.mass = p.cells.reduce((sum, c) => sum + c.mass, 0);
+      p.peak = Math.max(p.peak, p.mass);
+    }
+    return eaten;
+  }
+
+  // Every cell big enough splits in two, flinging the new half towards where the player is aiming.
+  split(p) {
+    p.lastSplit = this.time;
+    const dx = Math.cos(p.angle);
+    const dy = Math.sin(p.angle);
+    for (const c of [...p.cells].sort((a, b) => b.mass - a.mass)) {
+      if (p.cells.length >= MAX_CELLS) break;
+      if (c.mass < MIN_SPLIT_MASS) continue;
+      const half = c.mass / 2;
+      c.mass = half;
+      const r = radiusOf(half);
+      const n = this.newCell(c.x + dx * r, c.y + dy * r, half);
+      n.vx = dx * SPLIT_SPEED;
+      n.vy = dy * SPLIT_SPEED;
+      c.mergeAt = n.mergeAt = this.time + mergeDelay(half * 2);
+      p.cells.push(n);
+    }
   }
 
   move(p, dt) {
-    const r = radiusOf(p.mass);
-    let speed = speedOf(p.mass) * p.throttle;
-    if (p.boost && p.mass > START_MASS + 5 && p.throttle > 0.1) {
-      speed *= BOOST_MULT;
-      p.mass -= BOOST_COST * dt;
-      p.dropTimer += dt;
-      // Boosting leaves a trail of food behind you, so the mass spent isn't lost from the arena.
-      if (p.dropTimer > 1 / BOOST_COST) {
-        p.dropTimer = 0;
-        this.pellets.push({
-          x: p.x - Math.cos(p.angle) * r * 1.2,
-          y: p.y - Math.sin(p.angle) * r * 1.2,
-          hue: p.hue,
-        });
+    // All cells steer towards one point ahead of the player's centre. At zero throttle that point
+    // is the centre itself, so split cells drift back together.
+    const centre = centroid(p);
+    const reach = STEER_REACH * p.throttle;
+    const tx = centre.x + Math.cos(p.angle) * reach;
+    const ty = centre.y + Math.sin(p.angle) * reach;
+
+    p.dropTimer += dt;
+    // Boosting leaves a trail of food behind each cell, so the mass spent isn't lost from the arena.
+    const dropNow = p.dropTimer > 1 / BOOST_COST;
+    if (dropNow) p.dropTimer = 0;
+
+    for (const c of p.cells) {
+      const r = radiusOf(c.mass);
+      const dx = tx - c.x;
+      const dy = ty - c.y;
+      const d = Math.hypot(dx, dy);
+      let speed = speedOf(c.mass) * Math.min(1, d / STEER_REACH);
+      if (p.boost && c.mass > START_MASS + 5 && d > 40) {
+        speed *= BOOST_MULT;
+        c.mass -= BOOST_COST * dt;
+        if (dropNow) {
+          this.pellets.add({ x: c.x - (dx / d) * r * 1.2, y: c.y - (dy / d) * r * 1.2, hue: p.hue });
+        }
       }
+      // Big cells slowly shrink so the leader is always catchable.
+      if (c.mass > 300) c.mass -= c.mass * 0.003 * dt;
+
+      if (d > 1) {
+        c.x += (dx / d) * speed * dt;
+        c.y += (dy / d) * speed * dt;
+      }
+      c.x += c.vx * dt;
+      c.y += c.vy * dt;
+      const friction = Math.exp(-SPLIT_FRICTION * dt);
+      c.vx *= friction;
+      c.vy *= friction;
+
+      const rNow = radiusOf(c.mass);
+      c.x = clamp(c.x, rNow, WORLD.w - rNow);
+      c.y = clamp(c.y, rNow, WORLD.h - rNow);
     }
-    // Big players slowly shrink so the leader is always catchable.
-    if (p.mass > 300) p.mass -= p.mass * 0.003 * dt;
-    p.x = clamp(p.x + Math.cos(p.angle) * speed * dt, r, WORLD.w - r);
-    p.y = clamp(p.y + Math.sin(p.angle) * speed * dt, r, WORLD.h - r);
   }
 
-  eatPellets(p) {
-    const r = radiusOf(p.mass);
+  eatPellets(c) {
+    const r = radiusOf(c.mass);
     const r2 = r * r;
-    for (let i = this.pellets.length - 1; i >= 0; i--) {
-      const f = this.pellets[i];
-      const dx = f.x - p.x;
-      const dy = f.y - p.y;
-      if (dx * dx + dy * dy > r2) continue;
-      p.mass += 1;
-      // Boost trails push the count above PELLET_COUNT; shrink back to it before respawning new food.
-      if (this.pellets.length > PELLET_COUNT) {
-        this.pellets[i] = this.pellets[this.pellets.length - 1];
-        this.pellets.pop();
-      } else {
-        this.pellets[i] = this.randomPellet();
+    this.pellets.forEachIn(c.x - r, c.y - r, c.x + r, c.y + r, (f) => {
+      if ((f.x - c.x) ** 2 + (f.y - c.y) ** 2 > r2) return false;
+      c.mass += 1;
+      return true;
+    });
+  }
+
+  // Until their merge timer runs out, a player's cells bump into each other instead of overlapping.
+  pushApartOwnCells(p) {
+    const cells = p.cells;
+    for (let i = 0; i < cells.length; i++) {
+      for (let j = i + 1; j < cells.length; j++) {
+        const a = cells[i];
+        const b = cells[j];
+        if (this.time >= a.mergeAt && this.time >= b.mergeAt) continue;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.01;
+        const overlap = radiusOf(a.mass) + radiusOf(b.mass) - d;
+        if (overlap <= 0) continue;
+        const push = (overlap / 2) * 0.5;
+        a.x -= (dx / d) * push;
+        a.y -= (dy / d) * push;
+        b.x += (dx / d) * push;
+        b.y += (dy / d) * push;
       }
     }
-    p.peak = Math.max(p.peak, p.mass);
+  }
+
+  mergeOwnCells(p) {
+    const cells = p.cells;
+    for (let i = 0; i < cells.length; i++) {
+      for (let j = cells.length - 1; j > i; j--) {
+        const a = cells[i];
+        const b = cells[j];
+        if (this.time < a.mergeAt || this.time < b.mergeAt) continue;
+        if (Math.hypot(a.x - b.x, a.y - b.y) > Math.max(radiusOf(a.mass), radiusOf(b.mass))) continue;
+        const total = a.mass + b.mass;
+        a.x = (a.x * a.mass + b.x * b.mass) / total;
+        a.y = (a.y * a.mass + b.y * b.mass) / total;
+        a.mass = total;
+        cells.splice(j, 1);
+      }
+    }
   }
 
   resolveCollisions() {
-    const eaten = new Map();
-    const list = [...this.players.values()];
-    for (const a of list) {
-      if (eaten.has(a.id)) continue;
-      const ra = radiusOf(a.mass);
-      for (const b of list) {
-        if (a === b || eaten.has(b.id) || a.mass < b.mass * EAT_RATIO) continue;
+    const all = [];
+    for (const p of this.players.values()) for (const c of p.cells) all.push({ c, p });
+    all.sort((a, b) => b.c.mass - a.c.mass); // biggest cells get first bite
+
+    const eatenCells = new Map(); // cell id -> name of the player who ate it
+    for (const a of all) {
+      if (eatenCells.has(a.c.id)) continue;
+      const ra = radiusOf(a.c.mass);
+      for (const b of all) {
+        if (a.p === b.p || eatenCells.has(b.c.id) || a.c.mass < b.c.mass * EAT_RATIO) continue;
         // b must be mostly swallowed, not just touched.
-        if (Math.hypot(a.x - b.x, a.y - b.y) < ra - radiusOf(b.mass) * 0.4) {
-          a.mass += b.mass * 0.8;
-          eaten.set(b.id, { killer: a.name, score: Math.floor(b.peak) });
-          this.players.delete(b.id);
+        if (Math.hypot(a.c.x - b.c.x, a.c.y - b.c.y) < ra - radiusOf(b.c.mass) * 0.4) {
+          a.c.mass += b.c.mass * 0.8;
+          eatenCells.set(b.c.id, a.p.name);
         }
       }
-      a.peak = Math.max(a.peak, a.mass);
+    }
+
+    const eaten = new Map();
+    if (eatenCells.size === 0) return eaten;
+    for (const p of this.players.values()) {
+      const lastCell = p.cells.find((c) => eatenCells.has(c.id));
+      p.cells = p.cells.filter((c) => !eatenCells.has(c.id));
+      if (p.cells.length === 0) {
+        eaten.set(p.id, { killer: eatenCells.get(lastCell.id), score: Math.floor(p.peak) });
+        this.players.delete(p.id);
+      }
     }
     return eaten;
   }
@@ -174,46 +344,60 @@ export class Game {
     if (p.thinkTimer > 0) return;
     p.thinkTimer = rand(0.2, 0.4);
 
-    const r = radiusOf(p.mass);
+    const centre = centroid(p);
+    let biggest = p.cells[0];
+    let smallest = p.cells[0];
+    for (const c of p.cells) {
+      if (c.mass > biggest.mass) biggest = c;
+      if (c.mass < smallest.mass) smallest = c;
+    }
+
     let threat = null;
     let threatD = Infinity;
     let prey = null;
     let preyD = Infinity;
     for (const o of this.players.values()) {
       if (o === p) continue;
-      const d = Math.hypot(o.x - p.x, o.y - p.y) - radiusOf(o.mass);
-      if (o.mass > p.mass * EAT_RATIO) {
-        if (d < 300 + r && d < threatD) {
-          threat = o;
-          threatD = d;
+      for (const c of o.cells) {
+        const d = Math.hypot(c.x - centre.x, c.y - centre.y) - radiusOf(c.mass);
+        if (c.mass > smallest.mass * EAT_RATIO) {
+          if (d < 300 + radiusOf(biggest.mass) && d < threatD) {
+            threat = c;
+            threatD = d;
+          }
+        } else if (biggest.mass > c.mass * EAT_RATIO && d < 450 && d < preyD) {
+          prey = c;
+          preyD = d;
         }
-      } else if (p.mass > o.mass * EAT_RATIO && d < 450 && d < preyD) {
-        prey = o;
-        preyD = d;
       }
     }
 
     p.boost = false;
+    p.throttle = 1;
     if (threat) {
-      p.angle = Math.atan2(p.y - threat.y, p.x - threat.x);
+      p.angle = Math.atan2(centre.y - threat.y, centre.x - threat.x);
       p.boost = threatD < 120;
       return;
     }
     if (prey) {
-      p.angle = Math.atan2(prey.y - p.y, prey.x - p.x);
-      p.boost = preyD < 150 && Math.random() < 0.5;
+      p.angle = Math.atan2(prey.y - centre.y, prey.x - centre.x);
+      // Split-attack when half of the biggest cell could still swallow the target.
+      p.splitRequested =
+        preyD < 250 && p.cells.length < 4 && biggest.mass / 2 > prey.mass * EAT_RATIO && Math.random() < 0.3;
+      p.boost = !p.splitRequested && preyD < 150 && Math.random() < 0.5;
       return;
     }
     let food = null;
     let foodD = 400 * 400;
-    for (const f of this.pellets) {
-      const d = (f.x - p.x) ** 2 + (f.y - p.y) ** 2;
+    this.pellets.forEachIn(centre.x - 400, centre.y - 400, centre.x + 400, centre.y + 400, (f) => {
+      const d = (f.x - centre.x) ** 2 + (f.y - centre.y) ** 2;
       if (d < foodD) {
         food = f;
         foodD = d;
       }
-    }
-    if (food) p.angle = Math.atan2(food.y - p.y, food.x - p.x);
+      return false;
+    });
+    if (food) p.angle = Math.atan2(food.y - centre.y, food.x - centre.x);
     else p.angle += rand(-0.6, 0.6);
   }
 
@@ -228,26 +412,42 @@ export class Game {
   // Viewers without a live player (menu / death screen) spectate the leader.
   snapshot(viewerId, leaderboard) {
     const me = this.players.get(viewerId);
-    const focus = me ??
-      this.players.get(leaderboard[0]?.[0]) ?? { x: WORLD.w / 2, y: WORLD.h / 2, mass: START_MASS };
-    const half = 1100 + radiusOf(focus.mass) * 3;
+    const target = me ?? this.players.get(leaderboard[0]?.[0]);
+    let focus = { x: WORLD.w / 2, y: WORLD.h / 2 };
+    let spread = 0;
+    if (target) {
+      focus = centroid(target);
+      for (const c of target.cells) {
+        spread = Math.max(spread, Math.hypot(c.x - focus.x, c.y - focus.y) + radiusOf(c.mass));
+      }
+    }
+    const half = 1100 + radiusOf(target?.mass ?? START_MASS) * 3 + spread;
     const inView = (x, y, pad) => Math.abs(x - focus.x) < half + pad && Math.abs(y - focus.y) < half + pad;
 
-    const players = [];
+    const cells = [];
+    const owners = [];
     for (const p of this.players.values()) {
-      const r = radiusOf(p.mass);
-      if (inView(p.x, p.y, r)) players.push([p.id, Math.round(p.x), Math.round(p.y), Math.round(r), p.hue, p.name]);
+      let visible = false;
+      for (const c of p.cells) {
+        const r = radiusOf(c.mass);
+        if (!inView(c.x, c.y, r)) continue;
+        cells.push([c.id, p.id, Math.round(c.x), Math.round(c.y), Math.round(r)]);
+        visible = true;
+      }
+      if (visible) owners.push([p.id, p.name, p.hue]);
     }
     const pellets = [];
-    for (const f of this.pellets) {
-      if (inView(f.x, f.y, 0)) pellets.push(Math.round(f.x), Math.round(f.y), f.hue);
-    }
+    this.pellets.forEachIn(focus.x - half, focus.y - half, focus.x + half, focus.y + half, (f) => {
+      pellets.push(Math.round(f.x), Math.round(f.y), f.hue);
+      return false;
+    });
     return {
       t: 's',
       you: me ? me.id : null,
       mass: me ? Math.floor(me.mass) : 0,
       cam: [Math.round(focus.x), Math.round(focus.y)],
-      p: players,
+      c: cells,
+      o: owners,
       f: pellets,
       lb: leaderboard,
       online: this.players.size,

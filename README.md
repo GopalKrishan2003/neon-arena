@@ -2,7 +2,9 @@
 
 **▶ Play now: https://neon-arena-jeej.onrender.com** (on the free plan, the first load can take up to a minute while the server wakes up)
 
-A real-time multiplayer `.io` browser game. Eat glowing pellets to grow, swallow smaller players, and avoid bigger ones. Boosting makes you faster but costs mass, and it leaves a trail of food that others can grab.
+A real-time multiplayer `.io` browser game. Eat glowing pellets to grow, swallow smaller players, and avoid bigger ones. **Split** to fling half of each cell forward and catch fleeing prey. Your cells rejoin after a cooldown, but small split cells are easy targets. Boosting makes you faster but costs mass, and it leaves a trail of food that others can grab.
+
+**Controls:** steer with the mouse · **Space** to split · click or **Shift** to boost. On mobile: drag to steer · **SPLIT** button · two fingers to boost.
 
 ## Run locally
 
@@ -20,7 +22,7 @@ Open http://localhost:3000. Open a second tab to play against yourself. Bots kee
 
 | File | Purpose |
 |---|---|
-| `server/game.js` | Game rules: movement, eating, boosting, bot AI, per-player views |
+| `server/game.js` | Game rules: movement, splitting and merging, eating, boosting, bot AI, per-player views |
 | `server/index.js` | HTTP static server, WebSocket connections, game loop |
 | `public/client.js` | Networking, input, rendering |
 
@@ -33,7 +35,7 @@ Open http://localhost:3000. Open a second tab to play against yourself. Bots kee
 ## Roadmap
 
 - [ ] Binary protocol to cut bandwidth
-- [ ] Splitting into several cells (the classic `.io` move)
+- [x] Splitting into several cells (the classic `.io` move)
 - [ ] Skins and cosmetics, the main way to make money
 - [ ] Ads between rounds through the Poki or CrazyGames SDK
 - [ ] Rooms, plus "play with friends" invite links

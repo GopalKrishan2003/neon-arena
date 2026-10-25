@@ -59,6 +59,8 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ t: 'joined', id: client.playerId }));
     } else if (msg?.t === 'input' && client.playerId !== null) {
       game.setInput(client.playerId, msg);
+    } else if (msg?.t === 'split' && client.playerId !== null) {
+      game.requestSplit(client.playerId);
     }
   });
 

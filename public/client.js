@@ -8,6 +8,7 @@ const statusEl = document.getElementById('status');
 const leaderboardEl = document.getElementById('leaderboard');
 const scoreEl = document.getElementById('score');
 const onlineEl = document.getElementById('online');
+const splitBtn = document.getElementById('split-btn');
 
 let ws;
 let world = { w: 4000, h: 4000 };
@@ -54,6 +55,7 @@ function handle(msg) {
     case 'joined':
       myId = msg.id;
       menu.hidden = true;
+      document.body.classList.add('playing');
       break;
     case 'dead':
       myId = null;
@@ -67,17 +69,29 @@ function handle(msg) {
 
 function applySnapshot(s) {
   latest = s;
+  const owners = new Map(s.o.map(([id, name, hue]) => [id, { name, hue }]));
   const seen = new Set();
-  for (const [id, x, y, r, hue, name] of s.p) {
+  for (const [id, owner, x, y, r] of s.c) {
     seen.add(id);
     const b = blobs.get(id);
     if (b) {
       b.tx = x;
       b.ty = y;
       b.tr = r;
-    } else {
-      blobs.set(id, { x, y, r, tx: x, ty: y, tr: r, hue, name });
+      continue;
     }
+    // A freshly split cell starts inside its sibling, so it visibly shoots out instead of popping in.
+    let start = { x, y };
+    let nearest = Infinity;
+    for (const o of blobs.values()) {
+      const d = o.owner === owner ? Math.hypot(o.x - x, o.y - y) : Infinity;
+      if (d < nearest && d < o.r * 3) {
+        nearest = d;
+        start = o;
+      }
+    }
+    const { name, hue } = owners.get(owner);
+    blobs.set(id, { x: start.x, y: start.y, r, tx: x, ty: y, tr: r, owner, hue, name });
   }
   for (const id of blobs.keys()) if (!seen.has(id)) blobs.delete(id);
 
@@ -103,6 +117,7 @@ function renderLeaderboard(lb) {
 function showMenu(message) {
   statusEl.textContent = message;
   menu.hidden = false;
+  document.body.classList.remove('playing');
   input.boost = false;
   nameInput.focus();
 }
@@ -127,14 +142,22 @@ canvas.addEventListener('mousedown', (e) => {
 });
 window.addEventListener('mouseup', () => (input.boost = false));
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && e.target !== nameInput) {
-    input.boost = true;
+  if (e.target === nameInput) return;
+  if (e.code === 'Space') {
     e.preventDefault();
+    if (!e.repeat && myId !== null) send({ t: 'split' });
+  } else if (e.key === 'Shift') {
+    input.boost = true;
   }
 });
 window.addEventListener('keyup', (e) => {
-  if (e.code === 'Space') input.boost = false;
+  if (e.key === 'Shift') input.boost = false;
 });
+
+splitBtn.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  if (myId !== null) send({ t: 'split' });
+}, { passive: false });
 
 function onTouch(e) {
   e.preventDefault();
@@ -252,6 +275,25 @@ function drawMinimap(me) {
   ctx.fill();
 }
 
+// Area-weighted centre of my cells and how far they reach from it, or null if none are visible.
+function myCentre() {
+  let x = 0;
+  let y = 0;
+  let w = 0;
+  for (const b of blobs.values()) {
+    if (b.owner !== myId) continue;
+    x += b.x * b.r * b.r;
+    y += b.y * b.r * b.r;
+    w += b.r * b.r;
+  }
+  if (w === 0) return null;
+  const centre = { x: x / w, y: y / w, spread: 0 };
+  for (const b of blobs.values()) {
+    if (b.owner === myId) centre.spread = Math.max(centre.spread, Math.hypot(b.x - centre.x, b.y - centre.y) + b.r);
+  }
+  return centre;
+}
+
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
@@ -265,7 +307,7 @@ function frame(now) {
     b.r += (b.tr - b.r) * k;
   }
 
-  const me = myId !== null ? blobs.get(myId) : null;
+  const me = myId !== null ? myCentre() : null;
   if (me) {
     camera.x = me.x;
     camera.y = me.y;
@@ -273,8 +315,9 @@ function frame(now) {
     camera.x += (latest.cam[0] - camera.x) * k;
     camera.y += (latest.cam[1] - camera.y) * k;
   }
-  // Zoom out as you grow. The server sends a slightly wider area than this, so edges never pop in.
-  const targetScale = Math.max(cw, ch) / 2 / (800 + 2.5 * (me ? me.r : 60));
+  // Zoom out as you grow or spread out. The server sends a slightly wider area, so edges never pop in.
+  const viewHalf = me ? 800 + 2.5 * 6 * Math.sqrt(latest.mass) + me.spread : 950;
+  const targetScale = Math.max(cw, ch) / 2 / viewHalf;
   camera.scale += (targetScale - camera.scale) * (1 - Math.exp(-dt * 3));
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
