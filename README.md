@@ -24,7 +24,9 @@ Open http://localhost:3000. Open a second tab to play against yourself. Bots kee
 
 ## Deploy for free
 
-Any Node host that supports WebSockets will work. On Render's free plan, create a **Web Service**, set the build command to `npm install` and the start command to `npm start`. Free instances sleep when idle, so the first visit takes a few seconds to wake.
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/GopalKrishan2003/neon-arena)
+
+`render.yaml` sets up a free Render web service. Any other Node host that supports WebSockets also works. Free instances sleep when idle, so the first visit after a quiet spell takes about 30–60 seconds to wake.
 
 ## Roadmap
 
