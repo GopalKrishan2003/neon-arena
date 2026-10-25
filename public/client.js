@@ -15,6 +15,16 @@ const toastEl = $('toast');
 const splitBtn = $('split-btn');
 const boostBtn = $('boost-btn');
 const modeButtons = [...document.querySelectorAll('.mode')];
+const connEl = $('conn');
+const roomChip = $('room-chip');
+const createRoomBtn = $('create-room');
+const roomInput = $('room-input');
+const joinRoomBtn = $('join-room');
+const roomCurrent = $('room-current');
+const roomCodeEl = $('room-code');
+const roomModeEl = $('room-mode');
+const shareRoomBtn = $('share-room');
+const leaveRoomBtn = $('leave-room');
 
 // Mirrors of server/game.js rules, used to predict my own movement without waiting for the server.
 const BOOST_FLOOR = 25;
@@ -61,6 +71,13 @@ let ws;
 let world = { w: 4000, h: 4000 };
 let myId = null;
 let mode = MODE_LABELS[store.get('mode')] ? store.get('mode') : 'medium';
+// Private room I'm in or watching (its code), and that room's difficulty.
+let room = null;
+let roomMode = null;
+let pendingRoom = new URLSearchParams(location.search).get('room'); // from a shared ?room= link
+let resumeToken = null; // lets me reclaim my cells if the connection drops mid-game
+let retries = 0;
+let reconnectTimer = null;
 const best = store.get('best', { easy: 0, medium: 0, hard: 0 });
 let pellets = [];
 let powerups = [];
@@ -84,22 +101,56 @@ const vibrate = (pattern) => navigator.userActivation?.hasBeenActive && navigato
 // ---- networking -----------------------------------------------------------
 
 function connect() {
+  clearTimeout(reconnectTimer);
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
   ws.onopen = () => {
+    retries = 0;
     playBtn.disabled = false;
-    playBtn.textContent = 'PLAY';
+    updatePlayLabel();
     if (statusEl.textContent.startsWith('Connection lost')) statusEl.textContent = '';
-    send({ t: 'watch', mode });
+    if (myId !== null && resumeToken) {
+      send({ t: 'resume', token: resumeToken });
+    } else {
+      watch();
+    }
   };
   ws.onmessage = (e) => handle(JSON.parse(e.data));
   ws.onclose = () => {
-    myId = null;
     playBtn.disabled = true;
     playBtn.textContent = 'Connecting…';
-    showMenu('Connection lost, reconnecting…');
-    setTimeout(connect, 1500);
+    if (myId !== null) {
+      // Mid-game: keep the game on screen and quietly reconnect. The server holds my cells for 30s.
+      connEl.hidden = false;
+    } else {
+      showMenu('Connection lost, reconnecting…');
+    }
+    // Retry fast at first, then back off so a dead server isn't hammered.
+    reconnectTimer = setTimeout(connect, Math.min(500 * 2 ** retries++, 8000));
   };
 }
+
+// Cell and player ids restart in every arena, so drop everything drawn from the previous one.
+function resetWorld() {
+  blobs.clear();
+  pellets = [];
+  powerups = [];
+}
+
+// The menu spectates whatever PLAY would join: a private room if I'm in one, else the chosen level.
+function watch() {
+  resetWorld();
+  if (pendingRoom) send({ t: 'watch', room: pendingRoom });
+  else if (room) send({ t: 'watch', room });
+  else send({ t: 'watch', mode });
+}
+
+// Phones often kill the connection while the app is in the background; reconnect as soon as it's back.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && ws?.readyState === WebSocket.CLOSED) connect();
+});
+
+// Render's free plan sleeps after 15 minutes without web requests, and game traffic doesn't count.
+setInterval(() => fetch('/health', { cache: 'no-store' }).catch(() => {}), 4 * 60 * 1000);
 
 function send(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -122,13 +173,43 @@ function handle(msg) {
       }
       break;
     case 'joined':
+      if (!msg.resumed) resetWorld();
       myId = msg.id;
-      lastEffects = [0, 0, 0];
+      resumeToken = msg.token;
+      connEl.hidden = true;
+      setRoom(msg.room, msg.mode);
+      if (!msg.resumed) lastEffects = [0, 0, 0];
       menu.hidden = true;
       document.body.classList.add('playing');
+      if (msg.room && !msg.resumed && createRoomBtn.dataset.creating) {
+        delete createRoomBtn.dataset.creating;
+        toast(`Room ${msg.room} created!`, '#36f1cd');
+        shareRoom(true);
+      }
+      break;
+    case 'resume-failed':
+      myId = null;
+      resumeToken = null;
+      connEl.hidden = true;
+      showMenu('You were away too long, so your cell was removed.');
+      watch();
+      break;
+    case 'room':
+      pendingRoom = null;
+      setRoom(msg.code, msg.mode);
+      break;
+    case 'error':
+      delete createRoomBtn.dataset.creating;
+      if (msg.code === 'no-room') {
+        pendingRoom = null;
+        setRoom(null);
+        watch();
+      }
+      statusEl.textContent = msg.message;
       break;
     case 'dead': {
       myId = null;
+      resumeToken = null;
       vibrate([80, 60, 160]);
       const previous = best[msg.mode] ?? 0;
       if (msg.score > previous) {
@@ -169,6 +250,9 @@ function applySnapshot(s) {
     seen.add(id);
     const { name, hue, flags } = owners.get(owner);
     let b = blobs.get(id);
+    // Cell ids are only unique within one arena, so after switching arenas an id can come back
+    // belonging to someone else. Treat that as a brand-new cell.
+    if (b && b.owner !== owner) b = null;
     if (!b) {
       // A freshly split cell starts inside its sibling, so it visibly shoots out instead of popping in.
       let start = { x, y, r };
@@ -181,6 +265,7 @@ function applySnapshot(s) {
         }
       }
       b = { owner, hue, name, x: start.x, y: start.y, r, px: start.x, py: start.y, born: performance.now(), samples: [] };
+      blobs.delete(id); // re-insert so a reused id doesn't keep its old place in draw order
       b.samples.push({ t: s.ts - 50, x: start.x, y: start.y, r });
       blobs.set(id, b);
     }
@@ -194,7 +279,9 @@ function applySnapshot(s) {
   for (const id of blobs.keys()) if (!seen.has(id)) blobs.delete(id);
 
   setText(scoreEl, myId ? `${s.mass}` : '');
-  setText(onlineEl, `${MODE_LABELS[mode]} · ${s.online} in arena`);
+  // Phones already show the room in its own chip, and the top bar has no room to spare.
+  const roomLabel = room && !isTouch ? `Room ${room} · ` : '';
+  setText(onlineEl, `${roomLabel}${MODE_LABELS[roomMode ?? mode]} · ${s.online}${isTouch ? '' : ' in arena'}`);
   renderLeaderboard(s.lb);
   renderEffects(s.fx);
 }
@@ -283,9 +370,87 @@ function selectMode(next) {
   mode = next;
   store.set('mode', mode);
   for (const btn of modeButtons) btn.setAttribute('aria-checked', btn.dataset.mode === mode);
-  document.body.dataset.mode = mode;
-  send({ t: 'watch', mode });
+  if (!room) {
+    document.body.dataset.mode = mode;
+    watch();
+  }
 }
+
+// ---- private rooms --------------------------------------------------------
+
+function updatePlayLabel() {
+  if (!playBtn.disabled) playBtn.textContent = room ? `PLAY IN ROOM ${room}` : 'PLAY';
+}
+
+function setRoom(code, codeMode) {
+  room = code ?? null;
+  roomMode = room ? codeMode : null;
+  document.body.classList.toggle('in-room', !!room);
+  document.body.dataset.mode = roomMode ?? mode;
+  roomCurrent.hidden = !room;
+  updatePlayLabel();
+  roomChip.hidden = !room;
+  if (room) {
+    roomCodeEl.textContent = room;
+    roomModeEl.textContent = MODE_LABELS[roomMode];
+    roomChip.querySelector('b').textContent = room;
+  }
+  // Keep the address bar shareable: it always points at the room I'm in.
+  const url = new URL(location.href);
+  if (room) url.searchParams.set('room', room);
+  else url.searchParams.delete('room');
+  history.replaceState(null, '', url);
+}
+
+async function shareRoom(quiet = false) {
+  if (!room) return;
+  const url = `${location.origin}/?room=${room}`;
+  if (!quiet && navigator.share) {
+    try {
+      await navigator.share({ title: 'Neon Arena', text: `Join my Neon Arena room: ${room}`, url });
+      return;
+    } catch {
+      // Cancelled, or sharing isn't allowed here; fall back to copying.
+    }
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast(quiet ? `Room ${room} · link copied` : 'Invite link copied!', '#36f1cd');
+  } catch {
+    if (!quiet) toast(`Room code: ${room}`, '#36f1cd');
+  }
+}
+
+createRoomBtn.addEventListener('click', () => {
+  createRoomBtn.dataset.creating = '1';
+  store.set('name', nameInput.value.trim());
+  send({ t: 'create', name: nameInput.value.trim(), mode });
+});
+
+function joinRoom() {
+  const code = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (code.length !== 5) {
+    statusEl.textContent = 'Room codes are 5 letters or numbers.';
+    return;
+  }
+  store.set('name', nameInput.value.trim());
+  send({ t: 'join', name: nameInput.value.trim(), room: code });
+}
+joinRoomBtn.addEventListener('click', joinRoom);
+roomInput.addEventListener('input', () => (roomInput.value = roomInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '')));
+roomInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    joinRoom();
+  }
+});
+shareRoomBtn.addEventListener('click', () => shareRoom());
+roomChip.addEventListener('click', () => shareRoom());
+leaveRoomBtn.addEventListener('click', () => {
+  setRoom(null);
+  statusEl.textContent = '';
+  watch();
+});
 
 for (const btn of modeButtons) btn.addEventListener('click', () => selectMode(btn.dataset.mode));
 selectMode(mode);
@@ -305,7 +470,7 @@ joinForm.addEventListener('submit', (e) => {
   const name = nameInput.value.trim();
   store.set('name', name);
   nameInput.blur(); // closes the on-screen keyboard
-  send({ t: 'join', name, mode });
+  send(room ? { t: 'join', name, room } : { t: 'join', name, mode });
 });
 
 // ---- input ----------------------------------------------------------------

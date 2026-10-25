@@ -19,8 +19,10 @@
   <div class="status-bar">
     <div class="hud score"><small>MASS</small><span id="score"></span></div>
     <div id="effects" class="effects"></div>
+    <button id="room-chip" class="room-chip" type="button" hidden>🔒 Room <b></b> <span>Invite</span></button>
   </div>
   <div id="toast" class="toast"></div>
+  <div id="conn" class="conn" hidden><span class="spinner"></span>Reconnecting…</div>
 
   <div class="touch-controls">
     <button id="boost-btn" class="ctrl boost" type="button" aria-label="Boost (hold)">
@@ -51,7 +53,24 @@
         </button>
       </div>
 
+      <div id="room-current" class="room-current" hidden>
+        <span>🔒 Private room <b id="room-code"></b> · <span id="room-mode"></span></span>
+        <div class="room-buttons">
+          <button type="button" id="share-room" class="ghost">Invite friends</button>
+          <button type="button" id="leave-room" class="ghost">Leave room</button>
+        </div>
+      </div>
+
       <button id="play" class="play" type="submit" disabled>Connecting…</button>
+
+      <div class="room-actions">
+        <div class="divider"><span>or play with friends</span></div>
+        <button type="button" id="create-room" class="ghost">＋ Create private room</button>
+        <div class="room-join">
+          <input id="room-input" maxlength="5" placeholder="ROOM CODE" autocomplete="off" autocapitalize="characters" spellcheck="false">
+          <button type="button" id="join-room" class="ghost">Join</button>
+        </div>
+      </div>
 
       <ul class="controls desktop-only">
         <li><kbd>Mouse</kbd> steer</li>

@@ -15,6 +15,10 @@ Grab **power-ups** scattered around the arena: ⚡ **Speed** (50% faster for 6s)
 | Food | lots | normal | scarce |
 | Bots | slow, react late, never split | chase and sometimes split-attack | quick, see far, split-attack often and hunt humans first |
 
+**Private rooms:** tap **Create private room** to get a 5-character code, such as `R2H65`, and share the invite link (`/?room=R2H65`). Friends can open the link or type the code to join. A room uses the difficulty you had selected and closes after a minute with nobody in it.
+
+**Dropped connections:** if your connection drops mid-game (a network blip, or switching apps on your phone), the game reconnects on its own and puts you back on your own cells. The server holds them for 30 seconds.
+
 **Controls:** steer with the mouse · **Space** to split · click or **Shift** to boost. On phones: a virtual joystick under your left thumb, plus **BOOST** (hold) and **SPLIT** (tap) buttons on the right.
 
 ## Run locally
