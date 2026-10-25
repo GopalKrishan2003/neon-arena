@@ -73,12 +73,18 @@ wss.on('connection', (ws) => {
 setInterval(() => {
   const eaten = game.tick(1 / TICK_RATE);
   const leaderboard = game.leaderboard();
+  // Bots eating bots would flood the kill feed, so only kills involving a human are announced.
+  const feed = [...eaten.values()].filter((d) => !d.botsOnly).map((d) => [d.killer, d.victim]);
   for (const [ws, client] of clients) {
     if (ws.readyState !== ws.OPEN) continue;
+    if (feed.length) ws.send(JSON.stringify({ t: 'feed', kills: feed }));
+    for (const d of eaten.values()) {
+      if (d.killerId === client.playerId) ws.send(JSON.stringify({ t: 'kill', victim: d.victim, score: d.score }));
+    }
     const death = eaten.get(client.playerId);
     if (death) {
       client.playerId = null;
-      ws.send(JSON.stringify({ t: 'dead', ...death }));
+      ws.send(JSON.stringify({ t: 'dead', killer: death.killer, score: death.score }));
     }
     ws.send(JSON.stringify(game.snapshot(client.playerId, leaderboard)));
   }

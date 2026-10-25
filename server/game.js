@@ -16,6 +16,15 @@ const STEER_REACH = 400; // full throttle aims this far ahead of the player's ce
 const mergeDelay = (mass) => 8 + mass * 0.02; // seconds before split cells can rejoin
 const GRID = 128; // pellet bucket size
 
+// Power-up orbs scattered around the arena. Order matters: the client indexes its icons by it.
+const POWERUP_TYPES = ['speed', 'shield', 'magnet'];
+const POWERUP_DURATION = { speed: 6, shield: 5, magnet: 8 }; // seconds
+const POWERUP_COUNT = 6;
+const POWERUP_RESPAWN = 4; // seconds between new orbs while below POWERUP_COUNT
+const POWERUP_RADIUS = 18;
+const SPEED_MULT = 1.5;
+const MAGNET_REACH = 140; // extra pellet pickup range
+
 const BOT_NAMES = [
   'Nova', 'Pixel', 'Blip', 'Orbit', 'Zed', 'Echo', 'Volt', 'Rune',
   'Comet', 'Glitch', 'Byte', 'Flux', 'Neon', 'Quark', 'Drift', 'Sable',
@@ -83,12 +92,44 @@ export class Game {
     this.nextId = 1;
     this.nextCellId = 1;
     this.time = 0;
+    this.powerups = [];
+    this.nextPowerupAt = 0;
     this.refillPellets();
+    while (this.powerups.length < POWERUP_COUNT) this.spawnPowerup();
   }
 
   refillPellets() {
     while (this.pellets.count < PELLET_COUNT) {
       this.pellets.add({ x: rand(0, WORLD.w), y: rand(0, WORLD.h), hue: Math.floor(rand(0, 360)) });
+    }
+    if (this.powerups.length < POWERUP_COUNT && this.time >= this.nextPowerupAt) {
+      this.spawnPowerup();
+      this.nextPowerupAt = this.time + POWERUP_RESPAWN;
+    }
+  }
+
+  spawnPowerup() {
+    this.powerups.push({
+      x: rand(100, WORLD.w - 100),
+      y: rand(100, WORLD.h - 100),
+      type: Math.floor(Math.random() * POWERUP_TYPES.length),
+    });
+  }
+
+  hasEffect(p, type) {
+    return p.effects[type] > this.time;
+  }
+
+  pickUpPowerups(p) {
+    for (const c of p.cells) {
+      const reach = radiusOf(c.mass) + POWERUP_RADIUS;
+      for (let i = this.powerups.length - 1; i >= 0; i--) {
+        const pu = this.powerups[i];
+        if (Math.hypot(pu.x - c.x, pu.y - c.y) > reach) continue;
+        const type = POWERUP_TYPES[pu.type];
+        p.effects[type] = this.time + POWERUP_DURATION[type];
+        this.powerups.splice(i, 1);
+      }
     }
   }
 
@@ -135,6 +176,7 @@ export class Game {
       lastSplit: -Infinity,
       dropTimer: 0,
       thinkTimer: 0,
+      effects: { speed: 0, shield: 0, magnet: 0 }, // game time each power-up wears off
     };
     this.players.set(p.id, p);
     return p;
@@ -169,7 +211,9 @@ export class Game {
         this.split(p);
       }
       this.move(p, dt);
-      for (const c of p.cells) this.eatPellets(c);
+      const pelletReach = this.hasEffect(p, 'magnet') ? MAGNET_REACH : 0;
+      for (const c of p.cells) this.eatPellets(c, pelletReach);
+      this.pickUpPowerups(p);
       this.pushApartOwnCells(p);
       this.mergeOwnCells(p);
     }
@@ -213,13 +257,14 @@ export class Game {
     // Boosting leaves a trail of food behind each cell, so the mass spent isn't lost from the arena.
     const dropNow = p.dropTimer > 1 / BOOST_COST;
     if (dropNow) p.dropTimer = 0;
+    const speedBonus = this.hasEffect(p, 'speed') ? SPEED_MULT : 1;
 
     for (const c of p.cells) {
       const r = radiusOf(c.mass);
       const dx = tx - c.x;
       const dy = ty - c.y;
       const d = Math.hypot(dx, dy);
-      let speed = speedOf(c.mass) * Math.min(1, d / STEER_REACH);
+      let speed = speedOf(c.mass) * Math.min(1, d / STEER_REACH) * speedBonus;
       if (p.boost && c.mass > START_MASS + 5 && d > 40) {
         speed *= BOOST_MULT;
         c.mass -= BOOST_COST * dt;
@@ -246,8 +291,8 @@ export class Game {
     }
   }
 
-  eatPellets(c) {
-    const r = radiusOf(c.mass);
+  eatPellets(c, extraReach) {
+    const r = radiusOf(c.mass) + extraReach;
     const r2 = r * r;
     this.pellets.forEachIn(c.x - r, c.y - r, c.x + r, c.y + r, (f) => {
       if ((f.x - c.x) ** 2 + (f.y - c.y) ** 2 > r2) return false;
@@ -300,16 +345,17 @@ export class Game {
     for (const p of this.players.values()) for (const c of p.cells) all.push({ c, p });
     all.sort((a, b) => b.c.mass - a.c.mass); // biggest cells get first bite
 
-    const eatenCells = new Map(); // cell id -> name of the player who ate it
+    const eatenCells = new Map(); // cell id -> the player who ate it
     for (const a of all) {
       if (eatenCells.has(a.c.id)) continue;
       const ra = radiusOf(a.c.mass);
       for (const b of all) {
         if (a.p === b.p || eatenCells.has(b.c.id) || a.c.mass < b.c.mass * EAT_RATIO) continue;
+        if (this.hasEffect(b.p, 'shield')) continue;
         // b must be mostly swallowed, not just touched.
         if (Math.hypot(a.c.x - b.c.x, a.c.y - b.c.y) < ra - radiusOf(b.c.mass) * 0.4) {
           a.c.mass += b.c.mass * 0.8;
-          eatenCells.set(b.c.id, a.p.name);
+          eatenCells.set(b.c.id, a.p);
         }
       }
     }
@@ -320,7 +366,14 @@ export class Game {
       const lastCell = p.cells.find((c) => eatenCells.has(c.id));
       p.cells = p.cells.filter((c) => !eatenCells.has(c.id));
       if (p.cells.length === 0) {
-        eaten.set(p.id, { killer: eatenCells.get(lastCell.id), score: Math.floor(p.peak) });
+        const killer = eatenCells.get(lastCell.id);
+        eaten.set(p.id, {
+          killer: killer.name,
+          killerId: killer.id,
+          victim: p.name,
+          score: Math.floor(p.peak),
+          botsOnly: p.isBot && killer.isBot,
+        });
         this.players.delete(p.id);
       }
     }
@@ -387,6 +440,12 @@ export class Game {
       p.boost = !p.splitRequested && preyD < 150 && Math.random() < 0.5;
       return;
     }
+    for (const pu of this.powerups) {
+      if (Math.hypot(pu.x - centre.x, pu.y - centre.y) < 300) {
+        p.angle = Math.atan2(pu.y - centre.y, pu.x - centre.x);
+        return;
+      }
+    }
     let food = null;
     let foodD = 400 * 400;
     this.pellets.forEachIn(centre.x - 400, centre.y - 400, centre.x + 400, centre.y + 400, (f) => {
@@ -434,7 +493,14 @@ export class Game {
         cells.push([c.id, p.id, Math.round(c.x), Math.round(c.y), Math.round(r)]);
         visible = true;
       }
-      if (visible) owners.push([p.id, p.name, p.hue]);
+      if (!visible) continue;
+      // Bit flags for active power-ups, in POWERUP_TYPES order, so the client can draw their effects.
+      const flags = POWERUP_TYPES.reduce((bits, type, i) => bits | (this.hasEffect(p, type) ? 1 << i : 0), 0);
+      owners.push([p.id, p.name, p.hue, flags]);
+    }
+    const powerups = [];
+    for (const pu of this.powerups) {
+      if (inView(pu.x, pu.y, POWERUP_RADIUS)) powerups.push(Math.round(pu.x), Math.round(pu.y), pu.type);
     }
     const pellets = [];
     this.pellets.forEachIn(focus.x - half, focus.y - half, focus.x + half, focus.y + half, (f) => {
@@ -449,6 +515,9 @@ export class Game {
       c: cells,
       o: owners,
       f: pellets,
+      pu: powerups,
+      // Seconds left on each of my power-ups, in POWERUP_TYPES order.
+      fx: me ? POWERUP_TYPES.map((type) => Math.max(0, Math.ceil(me.effects[type] - this.time))) : [],
       lb: leaderboard,
       online: this.players.size,
     };

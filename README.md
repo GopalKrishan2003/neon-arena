@@ -4,7 +4,9 @@
 
 A real-time multiplayer `.io` browser game. Eat glowing pellets to grow, swallow smaller players, and avoid bigger ones. **Split** to fling half of each cell forward and catch fleeing prey. Your cells rejoin after a cooldown, but small split cells are easy targets. Boosting makes you faster but costs mass, and it leaves a trail of food that others can grab.
 
-**Controls:** steer with the mouse · **Space** to split · click or **Shift** to boost. On mobile: drag to steer · **SPLIT** button · two fingers to boost.
+Grab **power-ups** scattered around the arena: ⚡ **Speed** (50% faster for 6s), 🛡️ **Shield** (can't be eaten for 5s) and 🧲 **Magnet** (pulls in food from afar for 8s). A live kill feed and "You ate X!" pop-ups show what's happening, and phones vibrate on kills, power-ups and death.
+
+**Controls:** steer with the mouse · **Space** to split · click or **Shift** to boost. On phones: a virtual joystick under your left thumb, plus **BOOST** (hold) and **SPLIT** (tap) buttons on the right.
 
 ## Run locally
 

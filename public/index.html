@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#05060f">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <title>Neon Arena</title>
   <meta name="description" content="Eat, grow and dominate the arena. A free multiplayer .io game in your browser.">
   <link rel="stylesheet" href="style.css">
@@ -11,17 +14,42 @@
   <canvas id="game"></canvas>
 
   <div id="online" class="hud hud-tl"></div>
+  <ol id="feed" class="feed"></ol>
   <ol id="leaderboard" class="hud hud-tr"></ol>
-  <div id="score" class="hud hud-bl"></div>
-  <button id="split-btn" class="split-btn" type="button">SPLIT</button>
+  <div class="status-bar">
+    <div id="score" class="hud score"></div>
+    <div id="effects" class="effects"></div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <div class="touch-controls">
+    <button id="boost-btn" class="ctrl boost" type="button"><span>⚡</span>BOOST</button>
+    <button id="split-btn" class="ctrl split" type="button"><span>✦</span>SPLIT</button>
+  </div>
 
   <div id="menu">
     <form id="join" class="card">
       <h1>NEON<span>ARENA</span></h1>
       <p id="status" class="status"></p>
-      <input id="name" maxlength="16" placeholder="Your name" autocomplete="off" autofocus>
+      <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
       <button id="play" type="submit" disabled>Connecting…</button>
-      <p class="hint">Steer with the mouse · Space to split · Click or Shift to boost<br>Mobile: drag to steer · SPLIT button · two fingers to boost</p>
+
+      <ul class="controls desktop-only">
+        <li><kbd>Mouse</kbd> steer</li>
+        <li><kbd>Space</kbd> split</li>
+        <li><kbd>Click</kbd> / <kbd>Shift</kbd> boost</li>
+      </ul>
+      <ul class="controls touch-only">
+        <li><kbd>Left thumb</kbd> joystick</li>
+        <li><kbd>⚡ BOOST</kbd> hold</li>
+        <li><kbd>✦ SPLIT</kbd> tap</li>
+      </ul>
+
+      <ul class="powerups">
+        <li><b style="color:#ffd23f">⚡ Speed</b>move 50% faster</li>
+        <li><b style="color:#4dd2ff">🛡️ Shield</b>nobody can eat you</li>
+        <li><b style="color:#c77dff">🧲 Magnet</b>pull in food from afar</li>
+      </ul>
     </form>
   </div>
 
