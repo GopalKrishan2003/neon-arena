@@ -1,0 +1,17 @@
+{
+  "name": "neon-arena",
+  "version": "0.1.0",
+  "description": "A real-time multiplayer .io browser game",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

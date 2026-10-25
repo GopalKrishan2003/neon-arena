@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Neon Arena</title>
+  <meta name="description" content="Eat, grow and dominate the arena. A free multiplayer .io game in your browser.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <div id="online" class="hud hud-tl"></div>
+  <ol id="leaderboard" class="hud hud-tr"></ol>
+  <div id="score" class="hud hud-bl"></div>
+
+  <div id="menu">
+    <form id="join" class="card">
+      <h1>NEON<span>ARENA</span></h1>
+      <p id="status" class="status"></p>
+      <input id="name" maxlength="16" placeholder="Your name" autocomplete="off" autofocus>
+      <button id="play" type="submit" disabled>Connecting…</button>
+      <p class="hint">Steer with the mouse · Click or Space to boost<br>Mobile: drag to steer · two fingers to boost</p>
+    </form>
+  </div>
+
+  <script src="client.js"></script>
+</body>
+</html>
